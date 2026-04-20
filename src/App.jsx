@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 const STORAGE_KEY = 'sixty_day_growth_tracker_v3';
+const SHARED_STATE_ID = 'shared-root';
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.replace(/\/$/, '');
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const SUPABASE_TABLE = import.meta.env.VITE_SUPABASE_TABLE || 'progress_tracking_state';
 const DAYS = 60;
 const PEOPLE = [
   { id: 'nachiket', name: 'Nachiket' },
@@ -175,6 +179,56 @@ function loadState() {
   };
 }
 
+function hasSharedSync() {
+  return Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+}
+
+async function loadSharedState() {
+  if (!hasSharedSync()) return null;
+
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${encodeURIComponent(SHARED_STATE_ID)}&select=data&limit=1`,
+    {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Shared state load failed (${response.status})`);
+  }
+
+  const rows = await response.json();
+  return rows?.[0]?.data || null;
+}
+
+async function saveSharedState(nextState) {
+  if (!hasSharedSync()) return;
+
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?on_conflict=id`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify({
+        id: SHARED_STATE_ID,
+        data: nextState,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Shared state save failed (${response.status})`);
+  }
+}
+
 function formatDate(date) {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
@@ -220,11 +274,75 @@ function App() {
   const [leetcodeFetching, setLeetcodeFetching] = useState(false);
   const [manualRoutineDraft, setManualRoutineDraft] = useState('');
   const [dayMenuOpen, setDayMenuOpen] = useState(false);
+  const [syncStatus, setSyncStatus] = useState(hasSharedSync() ? 'loading' : 'local');
+  const [syncError, setSyncError] = useState('');
+  const hydratedRef = useRef(!hasSharedSync());
+  const syncTimerRef = useRef(null);
   const dayPickerRef = useRef(null);
   const todayString = getLocalDateString();
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [state]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateSharedState() {
+      if (!hasSharedSync()) return;
+
+      try {
+        const remoteState = await loadSharedState();
+        if (cancelled) return;
+        if (remoteState) {
+          setState(remoteState);
+          setSyncStatus('synced');
+        } else {
+          await saveSharedState(state);
+          if (cancelled) return;
+          setSyncStatus('synced');
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setSyncError(error instanceof Error ? error.message : 'Shared sync failed');
+        setSyncStatus('local');
+      } finally {
+        if (!cancelled) {
+          hydratedRef.current = true;
+        }
+      }
+    }
+
+    hydrateSharedState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydratedRef.current || !hasSharedSync()) return;
+
+    setSyncError('');
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current);
+    }
+
+    syncTimerRef.current = setTimeout(async () => {
+      try {
+        await saveSharedState(state);
+        setSyncStatus('synced');
+      } catch (error) {
+        setSyncError(error instanceof Error ? error.message : 'Shared sync failed');
+        setSyncStatus('local');
+      }
+    }, 700);
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+      }
+    };
   }, [state]);
 
   useEffect(() => {
@@ -588,6 +706,10 @@ function App() {
           >
             Clear data
           </button>
+          <div className="sync-badge">
+            <span>{hasSharedSync() ? `Shared sync: ${syncStatus}` : 'Local only'}</span>
+            {syncError ? <small>{syncError}</small> : null}
+          </div>
         </div>
       </aside>
 
